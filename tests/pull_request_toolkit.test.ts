@@ -164,3 +164,38 @@ describe('linkIssuesMentionedInPullRequestBody', () => {
         await expect(makeToolkit(githubModel).linkIssuesMentionedInPullRequestBody()).rejects.toThrow('Something else');
     });
 });
+
+describe('findUsersChildTeamName', () => {
+    function makeTeamsGithubModel(
+        childTeamsByParentSlug: Record<string, { slug: string; name: string }[] | null>,
+        memberLoginsByTeamSlug: Record<string, string[]>,
+    ) {
+        return makeGithubModel({
+            getChildTeams: vi
+                .fn()
+                .mockImplementation((_org: string, parentTeamSlug: string) =>
+                    Promise.resolve(childTeamsByParentSlug[parentTeamSlug] ?? null),
+                ),
+            getTeamMembers: vi
+                .fn()
+                .mockImplementation((_org: string, teamSlug: string) =>
+                    Promise.resolve((memberLoginsByTeamSlug[teamSlug] ?? []).map((login) => ({ login }))),
+                ),
+        });
+    }
+
+    test('finds the team in a store-engineering child team when product-engineering does not exist', async () => {
+        const githubModel = makeTeamsGithubModel(
+            { 'product-engineering': null, 'store-engineering': [{ slug: 'store', name: 'Store' }] },
+            { store: ['alice'] },
+        );
+
+        await expect(makeToolkit(githubModel).findUsersChildTeamName('alice')).resolves.toBe('Store');
+    });
+
+    test('fails when none of the parent teams has any child teams', async () => {
+        const githubModel = makeTeamsGithubModel({ 'product-engineering': null, 'store-engineering': [] }, {});
+
+        await expect(makeToolkit(githubModel).findUsersChildTeamName('alice')).rejects.toThrow('No child teams found');
+    });
+});

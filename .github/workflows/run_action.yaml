@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-22.04-arm64
     steps:
       - name: Apify Pull Request Toolkit
-        uses: apify/pull-request-toolkit-action@main
+        uses: apify/pull-request-toolkit-action@feat/multiple-parent-teams
         with:
           org-github-token: ${{ secrets.PULL_REQUEST_TOOLKIT_ACTION_GITHUB_TOKEN }}
           apify-api-token: ${{ secrets.ACTOR_GITHUB_CONTROLLER_APIFY_API_TOKEN }}

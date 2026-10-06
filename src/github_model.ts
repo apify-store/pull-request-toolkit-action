@@ -38,14 +38,19 @@ export class GitHubModel {
     }
 
     /**
-     * Fetches the child teams of the given team in an organization.
+     * Fetches the child teams of the given team in an organization, or `null` if the organization has no such team.
      */
     public async getChildTeams(org: string, parentTeamSlug: string) {
-        return await this.octokit.paginate(this.octokit.rest.teams.listChildInOrg, {
-            org,
-            team_slug: parentTeamSlug,
-            per_page: 100,
-        });
+        try {
+            return await this.octokit.paginate(this.octokit.rest.teams.listChildInOrg, {
+                org,
+                team_slug: parentTeamSlug,
+                per_page: 100,
+            });
+        } catch (error) {
+            if (error && typeof error === 'object' && 'status' in error && error.status === 404) return null;
+            throw error;
+        }
     }
 
     /**

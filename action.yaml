@@ -6,7 +6,8 @@ inputs:
         required: true
         description: 'GitHub token with read and write access (required for GitHub Projects v2 sprint assignment)'
     apify-api-token:
-        required: true
+        # TODO: Temporarily optional while automatic sprint creation is disabled, we will get back to it.
+        required: false
         description: 'Apify API token with access to the platform-services/github-controller Actor'
 runs:
     using: 'composite'
