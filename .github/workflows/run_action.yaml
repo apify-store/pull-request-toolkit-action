@@ -13,7 +13,7 @@ jobs:
     # This is to make sure that this workflow is only run when the action is used from a different repository.
     # The workflow that tests the action against itself is in test_action.yaml.
     if: github.repository != 'apify-store/pull-request-toolkit-action'
-    runs-on: ubuntu-22.04-arm64
+    runs-on: ubuntu-latest
     steps:
       - name: Apify Pull Request Toolkit
         uses: apify-store/pull-request-toolkit-action@feat/multiple-parent-teams
