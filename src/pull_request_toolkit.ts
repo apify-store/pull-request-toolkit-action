@@ -3,7 +3,7 @@ import {
     KNOWN_BOT_USERS,
     LABELS,
     MANUAL_REFERENCE_LIMIT_ERROR_MESSAGE,
-    PRODUCT_ENGINEERING_TEAM_SLUG,
+    PARENT_TEAM_SLUGS,
     TEAM_LABEL_PREFIX,
     TEAM_NAME_TO_LABEL,
     TEAM_NAME_TO_PROJECT_TITLE,
@@ -135,14 +135,15 @@ export class PullRequestToolkit {
     }
 
     /**
-     * Finds whether the user is a member of any child team of the Product Engineering team and returns the name of that team.
+     * Finds whether the user is a member of any child team of the parent teams and returns the name of that team.
      */
-    public async findUsersProductEngineeringChildTeamName(userLogin: string): Promise<string | null> {
-        const childTeams = await this.githubModel.getChildTeams(
-            this.pullRequestRepoOwner,
-            PRODUCT_ENGINEERING_TEAM_SLUG,
-        );
-        if (!childTeams.length) throw new Error(`No child teams found in Product Engineering team!`);
+    public async findUsersChildTeamName(userLogin: string): Promise<string | null> {
+        const childTeams = [];
+        for (const parentTeamSlug of PARENT_TEAM_SLUGS) {
+            const parentsChildTeams = await this.githubModel.getChildTeams(this.pullRequestRepoOwner, parentTeamSlug);
+            childTeams.push(...(parentsChildTeams ?? []));
+        }
+        if (!childTeams.length) throw new Error(`No child teams found in ${PARENT_TEAM_SLUGS.join(', ')} teams!`);
 
         let teamName = null;
         for (const childTeam of childTeams) {
@@ -346,7 +347,8 @@ export class PullRequestToolkit {
             return;
         }
 
-        await this.ensureCurrentSprintInProject(projectNumber);
+        // TODO: Automatic sprint creation is temporarily disabled so that the apify-api-token is not needed, we will get back to it.
+        // await this.ensureCurrentSprintInProject(projectNumber);
 
         const currentSprint = this.getCurrentIteration(sprintField);
         if (!currentSprint) {

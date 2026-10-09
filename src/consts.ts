@@ -1,4 +1,4 @@
-export const PRODUCT_ENGINEERING_TEAM_SLUG = 'product-engineering';
+export const PARENT_TEAM_SLUGS: readonly string[] = ['product-engineering', 'store-engineering'];
 
 export const LABELS = {
     ADHOC: 'adhoc',

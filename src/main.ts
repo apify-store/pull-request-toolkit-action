@@ -2,6 +2,7 @@ import {
     KNOWN_BOT_USERS,
     LINKING_CHECK_RETRIES,
     LINKING_CHECK_DELAY_MILLIS,
+    PARENT_TEAM_SLUGS,
     SKIP_LINKING_AND_ESTIMATE_CHECKS_FOR_TEAMS,
     STATUS_FIELD_VALUES,
 } from './consts.ts';
@@ -47,7 +48,8 @@ export async function main({
         if (!input['org-github-token']) throw new Error('Missing org-github-token input!');
         const orgOctokit = getOctokit(input['org-github-token'], { retry: { enabled: true }, request: { retries: 3 } });
 
-        if (!input['apify-api-token']) throw new Error('Missing apify-api-token input!');
+        // TODO: Temporarily optional while automatic sprint creation is disabled, we will get back to it.
+        // if (!input['apify-api-token']) throw new Error('Missing apify-api-token input!');
         const gitHubControllerActorClient = new GitHubControllerActorClient(input['apify-api-token'] ?? '');
 
         const githubModel = new GitHubModel(orgOctokit, gitHubControllerActorClient);
@@ -104,10 +106,10 @@ export async function main({
             return;
         }
 
-        const teamName = await pullRequestToolkit.findUsersProductEngineeringChildTeamName(pullRequestHumanCreator);
+        const teamName = await pullRequestToolkit.findUsersChildTeamName(pullRequestHumanCreator);
         if (!teamName) {
             core.info(
-                `User ${pullRequestHumanCreator} is not a member of any Product Engineering team. Skipping toolkit action.`,
+                `User ${pullRequestHumanCreator} is not a member of any ${PARENT_TEAM_SLUGS.join(' or ')} team. Skipping toolkit action.`,
             );
             return;
         }

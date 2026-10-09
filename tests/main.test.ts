@@ -56,9 +56,7 @@ describe('main', () => {
         const closeIssues = vi
             .spyOn(PullRequestToolkit.prototype, 'closeIssuesMentionedInPullRequestBody')
             .mockResolvedValue();
-        vi.spyOn(PullRequestToolkit.prototype, 'findUsersProductEngineeringChildTeamName').mockResolvedValue(
-            'Infrastructure',
-        );
+        vi.spyOn(PullRequestToolkit.prototype, 'findUsersChildTeamName').mockResolvedValue('Infrastructure');
         vi.spyOn(PullRequestToolkit.prototype, 'isTested').mockResolvedValue(false);
         vi.spyOn(PullRequestToolkit.prototype, 'assignCreator').mockResolvedValue();
         vi.spyOn(PullRequestToolkit.prototype, 'getTeamLabels').mockResolvedValue(['t-infra']);
