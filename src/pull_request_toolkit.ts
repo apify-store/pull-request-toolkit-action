@@ -1,5 +1,8 @@
 import {
     PROJECT_FIELD_NAMES,
+    CONVENTIONAL_COMMIT_REGEXP,
+    EPIC_ISSUE_TYPE,
+    ISSUE_FIELD_NAMES,
     KNOWN_BOT_USERS,
     LABELS,
     MANUAL_REFERENCE_LIMIT_ERROR_MESSAGE,
@@ -455,36 +458,6 @@ export class PullRequestToolkit {
     }
 
     /**
-     * Gets all linked issues along with their parent issues.
-     */
-    private async getLinkedAndParentIssues() {
-        const linkedIssues = await this.getLinkedIssues();
-
-        const linkedAndParentIssues = [...linkedIssues];
-        for (let i = 0; i < linkedAndParentIssues.length; i++) {
-            const parentIssue = await this.githubModel.getParentIssue(
-                linkedAndParentIssues[i].owner,
-                linkedAndParentIssues[i].repo,
-                linkedAndParentIssues[i].number,
-            );
-            if (parentIssue) {
-                // Check if the parent issue is already in the list to avoid duplicates
-                if (
-                    !linkedAndParentIssues.find(
-                        (issue) =>
-                            issue.owner === parentIssue.owner &&
-                            issue.repo === parentIssue.repo &&
-                            issue.number === parentIssue.number,
-                    )
-                ) {
-                    linkedAndParentIssues.push(parentIssue);
-                }
-            }
-        }
-        return linkedAndParentIssues;
-    }
-
-    /**
      * Parses the pull request body for issue-closing references (e.g., "fixes #123") and returns the referenced issues.
      * This is a fallback/addition to `getNativelyLinkedIssuesForPullRequest`, since GitHub's own detection of such
      * references is not always reliable (e.g. references added by editing the body after the pull request creation).
@@ -650,23 +623,10 @@ export class PullRequestToolkit {
     }
 
     /**
-     * Checks whether the pull request or any of its linked issues has an estimate set in a project.
+     * Checks whether the issue has an estimate set in any of its projects.
      */
-    private async isPullRequestOrLinkedIssuesEstimated(linkedIssues: IssueOrPullRequestSpec[] = []) {
-        const projectItems = [
-            ...(await this.githubModel.getProjectItemsForPullRequest(
-                this.pullRequestRepoOwner,
-                this.pullRequestRepoName,
-                this.pullRequestNumber,
-            )),
-            ...(
-                await Promise.all(
-                    linkedIssues.map(async (issue) =>
-                        this.githubModel.getProjectItemsForIssue(issue.owner, issue.repo, issue.number),
-                    ),
-                )
-            ).flat(),
-        ];
+    private async isIssueEstimated(issue: IssueOrPullRequestSpec) {
+        const projectItems = await this.githubModel.getProjectItemsForIssue(issue.owner, issue.repo, issue.number);
         for (const projectItem of projectItems) {
             const estimate = await this.getEstimateInProjectItems(projectItem.id);
             // `null` means the field isn't set; `0` is a valid estimate.
@@ -678,21 +638,59 @@ export class PullRequestToolkit {
     }
 
     /**
-     * Checks whether the pull request is properly linked to issues (or marked as adhoc) and whether it is estimated.
+     * Lists what is wrong with the linking of the pull request, nothing when it is correct.
+     * The pull request must be linked to an issue or marked as adhoc,
+     * and every linked issue apart from epics must have an estimate, a type and a priority.
      */
-    public async isCorrectlyLinkedAndEstimated() {
-        const pullRequest = await this.githubModel.getPullRequest(
+    public async getLinkingProblems(): Promise<string[]> {
+        const pullRequest = await this.getPullRequest();
+        const linkedIssues = await this.getLinkedIssues();
+        if (linkedIssues.length === 0) {
+            const isAdhoc = pullRequest.labels.some((label: { name: string }) => label.name === LABELS.ADHOC);
+            return isAdhoc ? [] : ['Pull request is not linked to a GitHub issue, and is not marked as adhoc.'];
+        }
+
+        const problems = [];
+        for (const linkedIssue of linkedIssues) {
+            const issue = await this.githubModel.getIssue(linkedIssue.owner, linkedIssue.repo, linkedIssue.number);
+            if (issue.type?.name === EPIC_ISSUE_TYPE) continue;
+
+            const issueFieldValues = await this.githubModel.getIssueFieldValues(
+                linkedIssue.owner,
+                linkedIssue.repo,
+                linkedIssue.number,
+            );
+            const missing = [];
+            // TODO: The estimate check is temporarily disabled, we will get back to it.
+            // if (!(await this.isIssueEstimated(linkedIssue))) missing.push('an estimate');
+            if (!issue.type) missing.push('a type');
+            if (issueFieldValues[ISSUE_FIELD_NAMES.PRIORITY] === undefined) missing.push('a priority');
+
+            if (missing.length) {
+                problems.push(
+                    `Linked issue ${linkedIssue.owner}/${linkedIssue.repo}#${linkedIssue.number} does not have ${missing.join(', ')}.`,
+                );
+            }
+        }
+        return problems;
+    }
+
+    /**
+     * Fetches the commits of the pull request and finds the titles of those not following Conventional Commits.
+     * Merge commits are not checked, they are created e.g. by updating the branch from GitHub.
+     */
+    public async getCommitsSummary() {
+        const commits = await this.githubModel.getPullRequestCommits(
             this.pullRequestRepoOwner,
             this.pullRequestRepoName,
             this.pullRequestNumber,
         );
-        const linkedIssues = await this.getLinkedAndParentIssues();
-        const isLinkedOrAdhoc =
-            linkedIssues.length > 0 ||
-            pullRequest.labels.some((label: { name: string }) => label.name === LABELS.ADHOC);
-        const isEstimated = await this.isPullRequestOrLinkedIssuesEstimated(linkedIssues);
+        const nonConventionalCommitTitles = commits
+            .filter((commit) => commit.parents.length < 2)
+            .map((commit) => commit.commit.message.split('\n')[0])
+            .filter((title) => !CONVENTIONAL_COMMIT_REGEXP.test(title));
 
-        return { isLinkedOrAdhoc, isEstimated };
+        return { commitCount: commits.length, nonConventionalCommitTitles };
     }
 
     /**

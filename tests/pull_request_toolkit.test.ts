@@ -18,8 +18,6 @@ function makeGithubModel(overrides: Partial<GitHubModel> = {}): Partial<GitHubMo
     return {
         getPullRequest: vi.fn().mockResolvedValue(basePullRequest),
         getNativelyLinkedIssuesForPullRequest: vi.fn().mockResolvedValue([]),
-        getParentIssue: vi.fn().mockResolvedValue(null),
-        getProjectItemsForPullRequest: vi.fn().mockResolvedValue([]),
         getProjectItemsForIssue: vi.fn().mockResolvedValue([]),
         // No "Estimate" key at all, which is what GitHub returns when the field was never set.
         getProjectItemFieldValues: vi.fn().mockResolvedValue({}),
@@ -31,81 +29,92 @@ function makeToolkit(githubModel: Partial<GitHubModel>) {
     return new PullRequestToolkit(githubModel as GitHubModel, mockCore, 'apify', 'apify-proxy', 1652);
 }
 
-describe('isCorrectlyLinkedAndEstimated', () => {
-    test('is not estimated when the linked issue has a project item but no estimate field value set', async () => {
-        const githubModel = makeGithubModel({
+describe('getLinkingProblems', () => {
+    function makeLinkedIssueGithubModel({
+        type = { name: 'Task' } as { name: string } | null,
+        priority = 'High' as string | null,
+        estimate = 3 as number | null,
+    } = {}) {
+        return makeGithubModel({
             getNativelyLinkedIssuesForPullRequest: vi
                 .fn()
                 .mockResolvedValue([{ owner: 'apify', repo: 'apify-proxy', number: 1627 }]),
-            getProjectItemsForIssue: vi.fn().mockResolvedValue([{ id: 'item-1' }]),
-        });
-
-        const { isLinkedOrAdhoc, isEstimated } = await makeToolkit(githubModel).isCorrectlyLinkedAndEstimated();
-
-        expect(isLinkedOrAdhoc).toBe(true);
-        expect(isEstimated).toBe(false);
-    });
-
-    test('is estimated when only a linked issue has the estimate field value set', async () => {
-        const githubModel = makeGithubModel({
-            getNativelyLinkedIssuesForPullRequest: vi
-                .fn()
-                .mockResolvedValue([{ owner: 'apify', repo: 'apify-proxy', number: 1627 }]),
-            getProjectItemsForPullRequest: vi.fn().mockResolvedValue([{ id: 'pr-item' }]),
+            getIssue: vi.fn().mockResolvedValue({ type }),
+            getIssueFieldValues: vi.fn().mockResolvedValue(priority === null ? {} : { Priority: priority }),
             getProjectItemsForIssue: vi.fn().mockResolvedValue([{ id: 'issue-item' }]),
+            // No "Estimate" key at all is what GitHub returns when the field was never set.
             getProjectItemFieldValues: vi
                 .fn()
-                .mockImplementation((projectItemId: string) =>
-                    Promise.resolve(
-                        projectItemId === 'issue-item'
-                            ? { Estimate: { id: 'field-1', dataType: 'NUMBER', value: 5 } }
-                            : {},
-                    ),
+                .mockResolvedValue(
+                    estimate === null ? {} : { Estimate: { id: 'field-1', dataType: 'NUMBER', value: estimate } },
                 ),
         });
+    }
 
-        const { isLinkedOrAdhoc, isEstimated } = await makeToolkit(githubModel).isCorrectlyLinkedAndEstimated();
-
-        expect(isLinkedOrAdhoc).toBe(true);
-        expect(isEstimated).toBe(true);
+    test('has no problems when the linked issue has an estimate, a type and a priority', async () => {
+        await expect(makeToolkit(makeLinkedIssueGithubModel()).getLinkingProblems()).resolves.toEqual([]);
     });
 
-    test('is estimated when the estimate field value is set on the pull request itself', async () => {
-        const githubModel = makeGithubModel({
-            getPullRequest: vi.fn().mockResolvedValue(adhocPullRequest),
-            getProjectItemsForPullRequest: vi.fn().mockResolvedValue([{ id: 'item-1' }]),
-            getProjectItemFieldValues: vi
-                .fn()
-                .mockResolvedValue({ Estimate: { id: 'field-1', dataType: 'NUMBER', value: 3 } }),
+    test('accepts an estimate of zero', async () => {
+        const githubModel = makeLinkedIssueGithubModel({ estimate: 0 });
+
+        await expect(makeToolkit(githubModel).getLinkingProblems()).resolves.toEqual([]);
+    });
+
+    test('lists everything the linked issue is missing', async () => {
+        const githubModel = makeLinkedIssueGithubModel({ type: null, priority: null, estimate: null });
+
+        // TODO: Put "an estimate" back once the estimate check is enabled again.
+        await expect(makeToolkit(githubModel).getLinkingProblems()).resolves.toEqual([
+            'Linked issue apify/apify-proxy#1627 does not have a type, a priority.',
+        ]);
+    });
+
+    test('does not check linked epics', async () => {
+        const githubModel = makeLinkedIssueGithubModel({
+            type: { name: 'Epic' },
+            priority: null,
+            estimate: null,
         });
 
-        const { isLinkedOrAdhoc, isEstimated } = await makeToolkit(githubModel).isCorrectlyLinkedAndEstimated();
-
-        expect(isLinkedOrAdhoc).toBe(true);
-        expect(isEstimated).toBe(true);
+        await expect(makeToolkit(githubModel).getLinkingProblems()).resolves.toEqual([]);
     });
 
-    test('is estimated when the estimate field value is zero', async () => {
+    test('does not check an adhoc pull request without linked issues', async () => {
+        const githubModel = makeGithubModel({ getPullRequest: vi.fn().mockResolvedValue(adhocPullRequest) });
+
+        await expect(makeToolkit(githubModel).getLinkingProblems()).resolves.toEqual([]);
+    });
+
+    test('fails when there are no linked issues and no adhoc label', async () => {
+        await expect(makeToolkit(makeGithubModel()).getLinkingProblems()).resolves.toEqual([
+            'Pull request is not linked to a GitHub issue, and is not marked as adhoc.',
+        ]);
+    });
+});
+
+describe('getCommitsSummary', () => {
+    function makeCommit(message: string, parentCount = 1) {
+        return { commit: { message }, parents: Array.from({ length: parentCount }, () => ({})) };
+    }
+
+    test('finds commits not following Conventional Commits, skipping merge commits', async () => {
         const githubModel = makeGithubModel({
-            getPullRequest: vi.fn().mockResolvedValue(adhocPullRequest),
-            getProjectItemsForPullRequest: vi.fn().mockResolvedValue([{ id: 'item-1' }]),
-            getProjectItemFieldValues: vi
+            getPullRequestCommits: vi
                 .fn()
-                .mockResolvedValue({ Estimate: { id: 'field-1', dataType: 'NUMBER', value: 0 } }),
+                .mockResolvedValue([
+                    makeCommit('feat(api): add endpoint\n\nCloses #1'),
+                    makeCommit('fix!: drop support'),
+                    makeCommit('Fix typo'),
+                    makeCommit('feature: something'),
+                    makeCommit("Merge branch 'main' into feat/x", 2),
+                ]),
         });
 
-        const { isEstimated } = await makeToolkit(githubModel).isCorrectlyLinkedAndEstimated();
-
-        expect(isEstimated).toBe(true);
-    });
-
-    test('is neither linked/adhoc nor estimated when there are no linked issues, labels, or project items', async () => {
-        const githubModel = makeGithubModel();
-
-        const { isLinkedOrAdhoc, isEstimated } = await makeToolkit(githubModel).isCorrectlyLinkedAndEstimated();
-
-        expect(isLinkedOrAdhoc).toBe(false);
-        expect(isEstimated).toBe(false);
+        await expect(makeToolkit(githubModel).getCommitsSummary()).resolves.toEqual({
+            commitCount: 5,
+            nonConventionalCommitTitles: ['Fix typo', 'feature: something'],
+        });
     });
 });
 

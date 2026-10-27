@@ -2,6 +2,7 @@ import {
     KNOWN_BOT_USERS,
     LINKING_CHECK_RETRIES,
     LINKING_CHECK_DELAY_MILLIS,
+    MAX_COMMITS_WITHOUT_WARNING,
     PARENT_TEAM_SLUGS,
     SKIP_LINKING_AND_ESTIMATE_CHECKS_FOR_TEAMS,
     STATUS_FIELD_VALUES,
@@ -146,13 +147,14 @@ export async function main({
         // Assigns the pull request creator.
         await pullRequestToolkit.assignCreator(pullRequestHumanCreator);
 
-        // Adds team label if not already there.
-        const teamLabelsOnPullRequest = await pullRequestToolkit.getTeamLabels();
-        if (!teamLabelsOnPullRequest.length) {
-            await pullRequestToolkit.addTeamLabel(teamName);
-        } else {
-            core.info(`Team labels already present on pull request: ${teamLabelsOnPullRequest.join(', ')}`);
-        }
+        // TODO: Adding the team label is temporarily disabled, we will get back to it.
+        // // Adds team label if not already there.
+        // const teamLabelsOnPullRequest = await pullRequestToolkit.getTeamLabels();
+        // if (!teamLabelsOnPullRequest.length) {
+        //     await pullRequestToolkit.addTeamLabel(teamName);
+        // } else {
+        //     core.info(`Team labels already present on pull request: ${teamLabelsOnPullRequest.join(', ')}`);
+        // }
 
         // Adds the pull request to the team project if it exists,
         // sets the status field to "Pull Request",
@@ -200,6 +202,19 @@ export async function main({
             core.info(`Team ${teamName} does not have a GitHub Project.`);
         }
 
+        const { commitCount, nonConventionalCommitTitles } = await pullRequestToolkit.getCommitsSummary();
+        if (commitCount > MAX_COMMITS_WITHOUT_WARNING) {
+            core.warning(
+                `Pull request has ${commitCount} commits, consider keeping it to ${MAX_COMMITS_WITHOUT_WARNING} at most.`,
+            );
+        }
+        if (nonConventionalCommitTitles.length) {
+            throw new UserError(
+                `These commits do not follow Conventional Commits (https://www.conventionalcommits.org): ${nonConventionalCommitTitles.map((title) => `"${title}"`).join(', ')}`,
+            );
+        }
+        core.info('All commits follow Conventional Commits.');
+
         if (SKIP_LINKING_AND_ESTIMATE_CHECKS_FOR_TEAMS.includes(teamName)) {
             core.info(`Team ${teamName} is excluded from linking and estimate checks. Finishing now`);
             return;
@@ -208,28 +223,27 @@ export async function main({
         // This check is retried a few times because linking/estimating an issue is often done by the author right after opening the PR,
         // so the data may not be there yet on the first check.
         core.info(
-            `Checking if pull request is linked to a GitHub issue, or is adhoc, and if it or its linked issues have an estimate.`,
+            `Checking if pull request is linked to a GitHub issue, or is adhoc, and if its linked issues have an estimate, a type and a priority.`,
         );
-        let isLinkedOrAdhoc = false;
-        let isEstimated = false;
+        let linkingProblems: string[] = [];
         for (let attempt = 1; attempt <= LINKING_CHECK_RETRIES; attempt++) {
-            ({ isLinkedOrAdhoc, isEstimated } = await pullRequestToolkit.isCorrectlyLinkedAndEstimated());
-            if (isLinkedOrAdhoc && isEstimated) {
+            linkingProblems = await pullRequestToolkit.getLinkingProblems();
+            if (!linkingProblems.length) {
                 break;
             }
 
             if (attempt < LINKING_CHECK_RETRIES) {
                 core.info(
-                    `Pull request is not correctly linked or estimated. Retrying in ${LINKING_CHECK_DELAY_MILLIS} milliseconds (attempt ${attempt}/${LINKING_CHECK_RETRIES})...`,
+                    `Pull request is not correctly linked: ${linkingProblems.join(' ')} Retrying in ${LINKING_CHECK_DELAY_MILLIS} milliseconds (attempt ${attempt}/${LINKING_CHECK_RETRIES})...`,
                 );
                 await new Promise((resolve) => setTimeout(resolve, LINKING_CHECK_DELAY_MILLIS));
             }
         }
-        if (!isLinkedOrAdhoc)
-            throw new UserError('Pull request is not linked to a GitHub issue, and is not marked as adhoc.');
-        if (!isEstimated) throw new UserError('Neither the pull request nor its linked issues have an estimate set.');
+        if (linkingProblems.length) throw new UserError(linkingProblems.join(' '));
 
-        core.info('Pull request is correctly linked to a GitHub issue, or is adhoc, and has an estimate.');
+        core.info(
+            'Pull request is correctly linked to a GitHub issue, or is adhoc, and its linked issues have an estimate, a type and a priority.',
+        );
 
         core.info('All checks passed!');
     } catch (error) {
