@@ -6,16 +6,17 @@ This action automates a couple of processes connected with the management of Git
 
 - Assigns the pull request to its creator.
 - Adds a `tested` label if the pull request changes any test files.
-- Assigns a team label (`t-[teamName]`) to the pull request if not present.
 - Assigns the pull request to the project board of the team that the pull request creator belongs to.
 - Assigns the pull request to the current sprint of that board if the team uses sprints.
+- Warns when the pull request has more than 5 commits.
 - Makes sure that:
-  - the pull request is either linked with an epic or an issue or labeled as `adhoc`
-  - the pull request itself or linked issue is estimated
+  - all commits follow [Conventional Commits](https://www.conventionalcommits.org) (merge commits are skipped)
+  - the pull request is either linked with an issue or labeled as `adhoc`
+  - every linked issue that is not an `Epic` has an estimate on its project board (temporarily disabled), a type and a priority
 
-The linkage and estimation checks are retried every 15 seconds for 2 minutes so that the user can set them up after the pull request is created without this action failing.
+The linking checks are retried every 15 seconds for 2 minutes so that the user can set them up after the pull request is created without this action failing.
 
-The action skips pull requests that come from external forks, that are closed, that do not target the repository's default branch, or whose creator is not a member of any Product Engineering team. Teams listed in `SKIP_LINKING_AND_ESTIMATE_CHECKS_FOR_TEAMS` in [`src/consts.ts`](src/consts.ts) are exempt from the linking and estimate checks.
+Once a pull request is merged into the default branch, the action closes the issues referenced in its body with a closing keyword (`closes #123`, `fixes: #123`, `resolves [#123](https://github.com/...)`), including pull requests from bots, and from forks for issues in the same repository. Otherwise, the action skips pull requests that come from external forks or bots, that are closed, that do not target the repository's default branch, or whose creator is not a member of any team under `PARENT_TEAM_SLUGS` in [`src/consts.ts`](src/consts.ts). Teams listed in `SKIP_LINKING_AND_ESTIMATE_CHECKS_FOR_TEAMS` in [`src/consts.ts`](src/consts.ts) are exempt from the linking and estimate checks.
 
 ## Action input
 

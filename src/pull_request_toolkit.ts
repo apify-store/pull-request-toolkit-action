@@ -1,9 +1,12 @@
 import {
     PROJECT_FIELD_NAMES,
+    CONVENTIONAL_COMMIT_REGEXP,
+    EPIC_ISSUE_TYPE,
+    ISSUE_FIELD_NAMES,
     KNOWN_BOT_USERS,
     LABELS,
     MANUAL_REFERENCE_LIMIT_ERROR_MESSAGE,
-    PRODUCT_ENGINEERING_TEAM_SLUG,
+    PARENT_TEAM_SLUGS,
     TEAM_LABEL_PREFIX,
     TEAM_NAME_TO_LABEL,
     TEAM_NAME_TO_PROJECT_TITLE,
@@ -19,6 +22,7 @@ import type {
     IterationField,
     SingleSelectField,
 } from './types.ts';
+import { asyncFilter } from './utils.ts';
 
 /**
  * A toolkit for working with pull requests with Apify-specific requirements.
@@ -72,6 +76,18 @@ export class PullRequestToolkit {
     public async isDraft(): Promise<boolean> {
         const pullRequest = await this.getPullRequest();
         return !!pullRequest.draft;
+    }
+
+    /**
+     * Checks whether the pull request body was edited after the pull request was merged.
+     */
+    public async isBodyEditedAfterMerge(): Promise<boolean> {
+        const { lastEditedAt, mergedAt } = await this.githubModel.getPullRequestBodyEditedAndMergedAt(
+            this.pullRequestRepoOwner,
+            this.pullRequestRepoName,
+            this.pullRequestNumber,
+        );
+        return !!lastEditedAt && !!mergedAt && new Date(lastEditedAt) > new Date(mergedAt);
     }
 
     /**
@@ -135,14 +151,15 @@ export class PullRequestToolkit {
     }
 
     /**
-     * Finds whether the user is a member of any child team of the Product Engineering team and returns the name of that team.
+     * Finds whether the user is a member of any child team of the parent teams and returns the name of that team.
      */
-    public async findUsersProductEngineeringChildTeamName(userLogin: string): Promise<string | null> {
-        const childTeams = await this.githubModel.getChildTeams(
-            this.pullRequestRepoOwner,
-            PRODUCT_ENGINEERING_TEAM_SLUG,
-        );
-        if (!childTeams.length) throw new Error(`No child teams found in Product Engineering team!`);
+    public async findUsersChildTeamName(userLogin: string): Promise<string | null> {
+        const childTeams = [];
+        for (const parentTeamSlug of PARENT_TEAM_SLUGS) {
+            const parentsChildTeams = await this.githubModel.getChildTeams(this.pullRequestRepoOwner, parentTeamSlug);
+            childTeams.push(...(parentsChildTeams ?? []));
+        }
+        if (!childTeams.length) throw new Error(`No child teams found in ${PARENT_TEAM_SLUGS.join(', ')} teams!`);
 
         let teamName = null;
         for (const childTeam of childTeams) {
@@ -346,7 +363,8 @@ export class PullRequestToolkit {
             return;
         }
 
-        await this.ensureCurrentSprintInProject(projectNumber);
+        // TODO: Automatic sprint creation is temporarily disabled so that the apify-api-token is not needed, we will get back to it.
+        // await this.ensureCurrentSprintInProject(projectNumber);
 
         const currentSprint = this.getCurrentIteration(sprintField);
         if (!currentSprint) {
@@ -440,41 +458,12 @@ export class PullRequestToolkit {
     }
 
     /**
-     * Gets all linked issues along with their parent issues.
-     */
-    private async getLinkedAndParentIssues() {
-        const linkedIssues = await this.getLinkedIssues();
-
-        const linkedAndParentIssues = [...linkedIssues];
-        for (let i = 0; i < linkedAndParentIssues.length; i++) {
-            const parentIssue = await this.githubModel.getParentIssue(
-                linkedAndParentIssues[i].owner,
-                linkedAndParentIssues[i].repo,
-                linkedAndParentIssues[i].number,
-            );
-            if (parentIssue) {
-                // Check if the parent issue is already in the list to avoid duplicates
-                if (
-                    !linkedAndParentIssues.find(
-                        (issue) =>
-                            issue.owner === parentIssue.owner &&
-                            issue.repo === parentIssue.repo &&
-                            issue.number === parentIssue.number,
-                    )
-                ) {
-                    linkedAndParentIssues.push(parentIssue);
-                }
-            }
-        }
-        return linkedAndParentIssues;
-    }
-
-    /**
      * Parses the pull request body for issue-closing references (e.g., "fixes #123") and returns the referenced issues.
      * This is a fallback/addition to `getNativelyLinkedIssuesForPullRequest`, since GitHub's own detection of such
      * references is not always reliable (e.g. references added by editing the body after the pull request creation).
+     * With `onlyInPullRequestRepository`, references to issues in other repositories are ignored.
      */
-    private async getIssuesMentionedInPullRequestBody() {
+    private async getIssuesMentionedInPullRequestBody({ onlyInPullRequestRepository = false } = {}) {
         const pullRequest = await this.githubModel.getPullRequest(
             this.pullRequestRepoOwner,
             this.pullRequestRepoName,
@@ -483,9 +472,10 @@ export class PullRequestToolkit {
         if (!pullRequest.body) return [];
 
         // These are native GitHub reference phrases which cause an issue to be automatically linked
+        // No `g` flag, since `.test()` with it is stateful and fails every other call on the same string
         const closingReferenceRegexp = new RegExp(
             '(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)',
-            'ig',
+            'i',
         );
         // These are non-native reference phrases (an Apify extension)
         const nonClosingReferenceRegexp = new RegExp('(part of)', 'ig');
@@ -498,28 +488,65 @@ export class PullRequestToolkit {
             'ig',
         );
         const issueShortRefRegexp = new RegExp('((?<owner>[^/\\s]+)/(?<repo>[^/\\s]+))?#(?<number>\\d+)', 'ig');
+        // The link text may omit the owner (e.g. `[#123](url)`), so the issue is taken from the URL
+        const issueMarkdownLinkRefRegexp = new RegExp(`\\[[^\\]\\n]*\\]\\(${issueUrlRefRegexp.source}\\)`, 'ig');
 
         const fullRegexp = new RegExp(
-            `${referenceRegexp.source}\\s+(${issueUrlRefRegexp.source}|${issueShortRefRegexp.source})`,
+            `\\b${referenceRegexp.source}:?\\s+(${issueMarkdownLinkRefRegexp.source}|${issueUrlRefRegexp.source}|${issueShortRefRegexp.source})`,
             'ig',
         );
 
-        return [
-            ...pullRequest.body.matchAll(fullRegexp).map((match) => ({
+        // Ignore references in code (like GitHub, usually examples) and in HTML comments (hidden from reviewers)
+        const bodyWithoutCode = pullRequest.body.replace(
+            /```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`|<!--[\s\S]*?-->/g,
+            '',
+        );
+
+        const mentions = [
+            ...bodyWithoutCode.matchAll(fullRegexp).map((match) => ({
                 isClosingReference: closingReferenceRegexp.test(match.groups!.reference),
                 isNativeReference: closingReferenceRegexp.test(match.groups!.reference), // Native GitHub references are all closing
                 owner: match.groups!.owner || pullRequest.base.repo.owner.login,
                 repo: match.groups!.repo || pullRequest.base.repo.name,
                 number: parseInt(match.groups!.number, 10),
             })),
-        ];
+        ].filter(
+            (mention) =>
+                !onlyInPullRequestRepository ||
+                (mention.owner.toLowerCase() === this.pullRequestRepoOwner.toLowerCase() &&
+                    mention.repo.toLowerCase() === this.pullRequestRepoName.toLowerCase()),
+        );
+
+        // Keep only issues, filter out pull requests
+        const mentionedIssues = asyncFilter(mentions, async (mention) => {
+            let issue;
+            try {
+                issue = await this.githubModel.getIssue(mention.owner, mention.repo, mention.number);
+            } catch (error) {
+                // Like GitHub, ignore references to missing (404) or deleted (410) issues, or ones we can't access
+                if (![404, 410].includes((error as { status?: number }).status!)) throw error;
+                this.core.warning(
+                    `${mention.owner}/${mention.repo}#${mention.number} mentioned in the pull request body was not found.`,
+                );
+                return false;
+            }
+            if (issue.pull_request) {
+                this.core.warning(
+                    `${mention.owner}/${mention.repo}#${mention.number} mentioned in the pull request body is also a pull request, not an issue.`,
+                );
+            }
+            return !issue.pull_request;
+        });
+
+        return mentionedIssues;
     }
 
     /**
      * Links all issues mentioned in the pull request body that are not native references.
+     * With `onlyInPullRequestRepository`, references to issues in other repositories are ignored.
      */
-    public async linkIssuesMentionedInPullRequestBody() {
-        const mentionedIssues = await this.getIssuesMentionedInPullRequestBody();
+    public async linkIssuesMentionedInPullRequestBody({ onlyInPullRequestRepository = false } = {}) {
+        const mentionedIssues = await this.getIssuesMentionedInPullRequestBody({ onlyInPullRequestRepository });
 
         // Native references are linked automatically by GitHub
         const nonNativeReferences = mentionedIssues.filter((issue) => !issue.isNativeReference);
@@ -547,6 +574,7 @@ export class PullRequestToolkit {
                 issueReference.repo,
                 issueReference.number,
             );
+
             try {
                 await this.githubModel.linkPullRequestToIssue(issue.node_id, pullRequest.node_id);
             } catch (error) {
@@ -567,9 +595,10 @@ export class PullRequestToolkit {
 
     /**
      * Closes all issues that are mentioned in the pull request body with a closing reference (e.g., "fixes #123").
+     * With `onlyInPullRequestRepository`, references to issues in other repositories are ignored.
      */
-    public async closeIssuesMentionedInPullRequestBody() {
-        const mentionedIssues = await this.getIssuesMentionedInPullRequestBody();
+    public async closeIssuesMentionedInPullRequestBody({ onlyInPullRequestRepository = false } = {}) {
+        const mentionedIssues = await this.getIssuesMentionedInPullRequestBody({ onlyInPullRequestRepository });
         const issuesToClose = mentionedIssues.filter((issue) => issue.isClosingReference);
         if (issuesToClose.length === 0) return;
 
@@ -594,23 +623,10 @@ export class PullRequestToolkit {
     }
 
     /**
-     * Checks whether the pull request or any of its linked issues has an estimate set in a project.
+     * Checks whether the issue has an estimate set in any of its projects.
      */
-    private async isPullRequestOrLinkedIssuesEstimated(linkedIssues: IssueOrPullRequestSpec[] = []) {
-        const projectItems = [
-            ...(await this.githubModel.getProjectItemsForPullRequest(
-                this.pullRequestRepoOwner,
-                this.pullRequestRepoName,
-                this.pullRequestNumber,
-            )),
-            ...(
-                await Promise.all(
-                    linkedIssues.map(async (issue) =>
-                        this.githubModel.getProjectItemsForIssue(issue.owner, issue.repo, issue.number),
-                    ),
-                )
-            ).flat(),
-        ];
+    private async isIssueEstimated(issue: IssueOrPullRequestSpec) {
+        const projectItems = await this.githubModel.getProjectItemsForIssue(issue.owner, issue.repo, issue.number);
         for (const projectItem of projectItems) {
             const estimate = await this.getEstimateInProjectItems(projectItem.id);
             // `null` means the field isn't set; `0` is a valid estimate.
@@ -622,21 +638,59 @@ export class PullRequestToolkit {
     }
 
     /**
-     * Checks whether the pull request is properly linked to issues (or marked as adhoc) and whether it is estimated.
+     * Lists what is wrong with the linking of the pull request, nothing when it is correct.
+     * The pull request must be linked to an issue or marked as adhoc,
+     * and every linked issue apart from epics must have an estimate, a type and a priority.
      */
-    public async isCorrectlyLinkedAndEstimated() {
-        const pullRequest = await this.githubModel.getPullRequest(
+    public async getLinkingProblems(): Promise<string[]> {
+        const pullRequest = await this.getPullRequest();
+        const linkedIssues = await this.getLinkedIssues();
+        if (linkedIssues.length === 0) {
+            const isAdhoc = pullRequest.labels.some((label: { name: string }) => label.name === LABELS.ADHOC);
+            return isAdhoc ? [] : ['Pull request is not linked to a GitHub issue, and is not marked as adhoc.'];
+        }
+
+        const problems = [];
+        for (const linkedIssue of linkedIssues) {
+            const issue = await this.githubModel.getIssue(linkedIssue.owner, linkedIssue.repo, linkedIssue.number);
+            if (issue.type?.name === EPIC_ISSUE_TYPE) continue;
+
+            const issueFieldValues = await this.githubModel.getIssueFieldValues(
+                linkedIssue.owner,
+                linkedIssue.repo,
+                linkedIssue.number,
+            );
+            const missing = [];
+            // TODO: The estimate check is temporarily disabled, we will get back to it.
+            // if (!(await this.isIssueEstimated(linkedIssue))) missing.push('an estimate');
+            if (!issue.type) missing.push('a type');
+            if (issueFieldValues[ISSUE_FIELD_NAMES.PRIORITY] === undefined) missing.push('a priority');
+
+            if (missing.length) {
+                problems.push(
+                    `Linked issue ${linkedIssue.owner}/${linkedIssue.repo}#${linkedIssue.number} does not have ${missing.join(', ')}.`,
+                );
+            }
+        }
+        return problems;
+    }
+
+    /**
+     * Fetches the commits of the pull request and finds the titles of those not following Conventional Commits.
+     * Merge commits are not checked, they are created e.g. by updating the branch from GitHub.
+     */
+    public async getCommitsSummary() {
+        const commits = await this.githubModel.getPullRequestCommits(
             this.pullRequestRepoOwner,
             this.pullRequestRepoName,
             this.pullRequestNumber,
         );
-        const linkedIssues = await this.getLinkedAndParentIssues();
-        const isLinkedOrAdhoc =
-            linkedIssues.length > 0 ||
-            pullRequest.labels.some((label: { name: string }) => label.name === LABELS.ADHOC);
-        const isEstimated = await this.isPullRequestOrLinkedIssuesEstimated(linkedIssues);
+        const nonConventionalCommitTitles = commits
+            .filter((commit) => commit.parents.length < 2)
+            .map((commit) => commit.commit.message.split('\n')[0])
+            .filter((title) => !CONVENTIONAL_COMMIT_REGEXP.test(title));
 
-        return { isLinkedOrAdhoc, isEstimated };
+        return { commitCount: commits.length, nonConventionalCommitTitles };
     }
 
     /**

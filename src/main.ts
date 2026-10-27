@@ -2,6 +2,8 @@ import {
     KNOWN_BOT_USERS,
     LINKING_CHECK_RETRIES,
     LINKING_CHECK_DELAY_MILLIS,
+    MAX_COMMITS_WITHOUT_WARNING,
+    PARENT_TEAM_SLUGS,
     SKIP_LINKING_AND_ESTIMATE_CHECKS_FOR_TEAMS,
     STATUS_FIELD_VALUES,
 } from './consts.ts';
@@ -25,29 +27,30 @@ export async function main({
     try {
         const pullRequestFromContext = context.payload.pull_request;
         if (!pullRequestFromContext) throw new UserError('This action works only for pull requests!');
+        core.info(
+            `Processing pull request https://github.com/${pullRequestFromContext.base.repo.owner.login}/${pullRequestFromContext.base.repo.name}/pull/${pullRequestFromContext.number}`,
+        );
 
-        if (pullRequestFromContext.head.repo.full_name !== pullRequestFromContext.base.repo.full_name) {
-            core.info(
-                `Skipping toolkit action for pull request from external fork: ${pullRequestFromContext.head.repo.full_name}`,
-            );
-            return;
-        }
-        core.info('Pull request is from an Apify organization, not from an external fork.');
-
+        // `head.repo` is null once the fork is deleted
+        const isFromFork = pullRequestFromContext.head.repo?.full_name !== pullRequestFromContext.base.repo.full_name;
         const isBotAuthor = KNOWN_BOT_USERS.some(
             (bot) => bot.toLowerCase() === pullRequestFromContext.user.login.toLowerCase(),
         );
-        if (isBotAuthor) {
-            core.info(`Skipping toolkit action for a pull request from bot user: ${pullRequestFromContext.user.login}`);
+
+        // Secrets are not provided to `pull_request` runs from forks and Dependabot, there is nothing we can do then.
+        if ((isFromFork || isBotAuthor) && !input['org-github-token']) {
+            core.info(
+                'Skipping toolkit action for a pull request from a fork or a bot, the secrets are not available.',
+            );
             return;
         }
 
-        // This secret is not provided for pull requests from forks, but we have skipped those already.
-        // If it is missing at this point, the action is misconfigured and we should fail.
+        // If the secret is missing at this point, the action is misconfigured and we should fail.
         if (!input['org-github-token']) throw new Error('Missing org-github-token input!');
         const orgOctokit = getOctokit(input['org-github-token'], { retry: { enabled: true }, request: { retries: 3 } });
 
-        if (!input['apify-api-token']) throw new Error('Missing apify-api-token input!');
+        // TODO: Temporarily optional while automatic sprint creation is disabled, we will get back to it.
+        // if (!input['apify-api-token']) throw new Error('Missing apify-api-token input!');
         const gitHubControllerActorClient = new GitHubControllerActorClient(input['apify-api-token'] ?? '');
 
         const githubModel = new GitHubModel(orgOctokit, gitHubControllerActorClient);
@@ -69,21 +72,41 @@ export async function main({
         }
         core.info('Pull request toolkit is required for this repository. Proceeding.');
 
+        // Fork authors control the body even after the merge, so forks only touch issues in their own repository.
+        // Link issues mentioned in the pull request body whenever the body is edited.
+        await pullRequestToolkit.linkIssuesMentionedInPullRequestBody({ onlyInPullRequestRepository: isFromFork });
+
+        // Replaces GitHub's auto-close, which is disabled because it also closes manually linked issues.
+        if ((await pullRequestToolkit.isMerged()) && (await pullRequestToolkit.isToDefaultBranch())) {
+            if (isFromFork && (await pullRequestToolkit.isBodyEditedAfterMerge())) {
+                core.warning(
+                    'Not closing referenced issues, the body of this pull request from a fork was edited after the merge.',
+                );
+            } else {
+                await pullRequestToolkit.closeIssuesMentionedInPullRequestBody({
+                    onlyInPullRequestRepository: isFromFork,
+                });
+            }
+        }
+
+        if (isFromFork) {
+            core.info(
+                `Skipping toolkit action for pull request from external fork: ${pullRequestFromContext.head.repo?.full_name ?? 'deleted repository'}`,
+            );
+            return;
+        }
+        core.info('Pull request is from an Apify organization, not from an external fork.');
+
+        if (isBotAuthor) {
+            core.info(`Skipping toolkit action for a pull request from bot user: ${pullRequestFromContext.user.login}`);
+            return;
+        }
+
         if (await pullRequestToolkit.isDraft()) {
             core.info('Pull request is a draft. Skipping toolkit action.');
             return;
         }
         core.info('Pull request is not a draft.');
-
-        // Link issues mentioned in the pull request body whenever the body is edited.
-        await pullRequestToolkit.linkIssuesMentionedInPullRequestBody();
-
-        // We close issues mentioned in the pull request body early on, even for pull requests not in product engineering.
-        // We disable the built-in GitHub automated closing issues when a pull request is merged,
-        // because it closed all linked issues, not just the ones mentioned with closing references.
-        if (await pullRequestToolkit.isMerged()) {
-            await pullRequestToolkit.closeIssuesMentionedInPullRequestBody();
-        }
 
         // A closed pull request belongs in "Closed", the status set below would move it back to "Pull Request".
         if (await pullRequestToolkit.isClosed()) {
@@ -104,10 +127,10 @@ export async function main({
             return;
         }
 
-        const teamName = await pullRequestToolkit.findUsersProductEngineeringChildTeamName(pullRequestHumanCreator);
+        const teamName = await pullRequestToolkit.findUsersChildTeamName(pullRequestHumanCreator);
         if (!teamName) {
             core.info(
-                `User ${pullRequestHumanCreator} is not a member of any Product Engineering team. Skipping toolkit action.`,
+                `User ${pullRequestHumanCreator} is not a member of any ${PARENT_TEAM_SLUGS.join(' or ')} team. Skipping toolkit action.`,
             );
             return;
         }
@@ -124,13 +147,14 @@ export async function main({
         // Assigns the pull request creator.
         await pullRequestToolkit.assignCreator(pullRequestHumanCreator);
 
-        // Adds team label if not already there.
-        const teamLabelsOnPullRequest = await pullRequestToolkit.getTeamLabels();
-        if (!teamLabelsOnPullRequest.length) {
-            await pullRequestToolkit.addTeamLabel(teamName);
-        } else {
-            core.info(`Team labels already present on pull request: ${teamLabelsOnPullRequest.join(', ')}`);
-        }
+        // TODO: Adding the team label is temporarily disabled, we will get back to it.
+        // // Adds team label if not already there.
+        // const teamLabelsOnPullRequest = await pullRequestToolkit.getTeamLabels();
+        // if (!teamLabelsOnPullRequest.length) {
+        //     await pullRequestToolkit.addTeamLabel(teamName);
+        // } else {
+        //     core.info(`Team labels already present on pull request: ${teamLabelsOnPullRequest.join(', ')}`);
+        // }
 
         // Adds the pull request to the team project if it exists,
         // sets the status field to "Pull Request",
@@ -178,6 +202,19 @@ export async function main({
             core.info(`Team ${teamName} does not have a GitHub Project.`);
         }
 
+        const { commitCount, nonConventionalCommitTitles } = await pullRequestToolkit.getCommitsSummary();
+        if (commitCount > MAX_COMMITS_WITHOUT_WARNING) {
+            core.warning(
+                `Pull request has ${commitCount} commits, consider keeping it to ${MAX_COMMITS_WITHOUT_WARNING} at most.`,
+            );
+        }
+        if (nonConventionalCommitTitles.length) {
+            throw new UserError(
+                `These commits do not follow Conventional Commits (https://www.conventionalcommits.org): ${nonConventionalCommitTitles.map((title) => `"${title}"`).join(', ')}`,
+            );
+        }
+        core.info('All commits follow Conventional Commits.');
+
         if (SKIP_LINKING_AND_ESTIMATE_CHECKS_FOR_TEAMS.includes(teamName)) {
             core.info(`Team ${teamName} is excluded from linking and estimate checks. Finishing now`);
             return;
@@ -186,28 +223,27 @@ export async function main({
         // This check is retried a few times because linking/estimating an issue is often done by the author right after opening the PR,
         // so the data may not be there yet on the first check.
         core.info(
-            `Checking if pull request is linked to a GitHub issue, or is adhoc, and if it or its linked issues have an estimate.`,
+            `Checking if pull request is linked to a GitHub issue, or is adhoc, and if its linked issues have an estimate, a type and a priority.`,
         );
-        let isLinkedOrAdhoc = false;
-        let isEstimated = false;
+        let linkingProblems: string[] = [];
         for (let attempt = 1; attempt <= LINKING_CHECK_RETRIES; attempt++) {
-            ({ isLinkedOrAdhoc, isEstimated } = await pullRequestToolkit.isCorrectlyLinkedAndEstimated());
-            if (isLinkedOrAdhoc && isEstimated) {
+            linkingProblems = await pullRequestToolkit.getLinkingProblems();
+            if (!linkingProblems.length) {
                 break;
             }
 
             if (attempt < LINKING_CHECK_RETRIES) {
                 core.info(
-                    `Pull request is not correctly linked or estimated. Retrying in ${LINKING_CHECK_DELAY_MILLIS} milliseconds (attempt ${attempt}/${LINKING_CHECK_RETRIES})...`,
+                    `Pull request is not correctly linked: ${linkingProblems.join(' ')} Retrying in ${LINKING_CHECK_DELAY_MILLIS} milliseconds (attempt ${attempt}/${LINKING_CHECK_RETRIES})...`,
                 );
                 await new Promise((resolve) => setTimeout(resolve, LINKING_CHECK_DELAY_MILLIS));
             }
         }
-        if (!isLinkedOrAdhoc)
-            throw new UserError('Pull request is not linked to a GitHub issue, and is not marked as adhoc.');
-        if (!isEstimated) throw new UserError('Neither the pull request nor its linked issues have an estimate set.');
+        if (linkingProblems.length) throw new UserError(linkingProblems.join(' '));
 
-        core.info('Pull request is correctly linked to a GitHub issue, or is adhoc, and has an estimate.');
+        core.info(
+            'Pull request is correctly linked to a GitHub issue, or is adhoc, and its linked issues have an estimate, a type and a priority.',
+        );
 
         core.info('All checks passed!');
     } catch (error) {

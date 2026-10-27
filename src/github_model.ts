@@ -38,14 +38,19 @@ export class GitHubModel {
     }
 
     /**
-     * Fetches the child teams of the given team in an organization.
+     * Fetches the child teams of the given team in an organization, or `null` if the organization has no such team.
      */
     public async getChildTeams(org: string, parentTeamSlug: string) {
-        return await this.octokit.paginate(this.octokit.rest.teams.listChildInOrg, {
-            org,
-            team_slug: parentTeamSlug,
-            per_page: 100,
-        });
+        try {
+            return await this.octokit.paginate(this.octokit.rest.teams.listChildInOrg, {
+                org,
+                team_slug: parentTeamSlug,
+                per_page: 100,
+            });
+        } catch (error) {
+            if (error && typeof error === 'object' && 'status' in error && error.status === 404) return null;
+            throw error;
+        }
     }
 
     /**
@@ -72,6 +77,30 @@ export class GitHubModel {
     }
 
     /**
+     * Fetches when the pull request body was last edited and when the pull request was merged.
+     */
+    public async getPullRequestBodyEditedAndMergedAt(
+        owner: string,
+        repo: string,
+        number: number,
+    ): Promise<{ lastEditedAt: string | null; mergedAt: string | null }> {
+        const response = await this.octokit.graphql<{
+            repository: { pullRequest: { lastEditedAt: string | null; mergedAt: string | null } };
+        }>(
+            `query getPullRequestBodyEditedAndMergedAt($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $number) {
+                        lastEditedAt
+                        mergedAt
+                    }
+                }
+            }`,
+            { owner, repo, number },
+        );
+        return response.repository.pullRequest;
+    }
+
+    /**
      * Fetches a pull request.
      */
     public async getPullRequest(owner: string, repo: string, number: number) {
@@ -88,6 +117,18 @@ export class GitHubModel {
      */
     public async getPullRequestFiles(owner: string, repo: string, number: number) {
         return await this.octokit.paginate(this.octokit.rest.pulls.listFiles, {
+            owner,
+            repo,
+            pull_number: number,
+            per_page: 100,
+        });
+    }
+
+    /**
+     * Fetches the commits of a pull request.
+     */
+    public async getPullRequestCommits(owner: string, repo: string, number: number) {
+        return await this.octokit.paginate(this.octokit.rest.pulls.listCommits, {
             owner,
             repo,
             pull_number: number,
@@ -173,26 +214,61 @@ export class GitHubModel {
     }
 
     /**
-     * Fetches the parent issue of the given issue, if any.
+     * Fetches the values of the organization issue fields (e.g. "Priority") set on an issue, keyed by field name.
+     * A single select value is its option name.
      */
-    public async getParentIssue(owner: string, repo: string, number: number) {
-        try {
-            const response = await this.octokit.rest.issues.getParent({
-                owner,
-                repo,
-                issue_number: number,
-            });
-            if (!response.data) return null;
-            return {
-                owner: response.data.repository!.owner.login,
-                repo: response.data.repository!.name,
-                number: response.data.number,
-            };
-        } catch (error) {
-            // GitHub returns 404 when the issue has no parent.
-            if (error && typeof error === 'object' && 'status' in error && error.status === 404) return null;
-            throw error;
-        }
+    public async getIssueFieldValues(
+        owner: string,
+        repo: string,
+        number: number,
+    ): Promise<{ [fieldName: string]: string | number }> {
+        const response = await this.octokit.graphql<{
+            repository: {
+                issue: {
+                    issueFieldValues: {
+                        nodes: ({
+                            field: { name: string } | null;
+                            value?: string | number | null;
+                            name?: string | null;
+                        } | null)[];
+                    };
+                } | null;
+            } | null;
+        }>(
+            `query getIssueFieldValues($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                    issue(number: $number) {
+                        issueFieldValues(first: 50) {
+                            nodes {
+                                ... on IssueFieldDateValue {
+                                    value
+                                    field { ... on IssueFieldDate { name } }
+                                }
+                                ... on IssueFieldTextValue {
+                                    value
+                                    field { ... on IssueFieldText { name } }
+                                }
+                                ... on IssueFieldNumberValue {
+                                    value
+                                    field { ... on IssueFieldNumber { name } }
+                                }
+                                ... on IssueFieldSingleSelectValue {
+                                    name
+                                    field { ... on IssueFieldSingleSelect { name } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }`,
+            // Issue fields are hidden from the GraphQL schema without this header.
+            { owner, repo, number, headers: { 'GraphQL-Features': 'issue_fields' } },
+        );
+        return Object.fromEntries(
+            (response.repository?.issue?.issueFieldValues.nodes ?? [])
+                .map((node) => [node?.field?.name, node?.value ?? node?.name] as const)
+                .filter((entry): entry is [string, string | number] => entry[0] != null && entry[1] != null),
+        );
     }
 
     /**
@@ -242,44 +318,6 @@ export class GitHubModel {
         return response.repository?.issue?.projectItems?.nodes ?? [];
     }
 
-    /**
-     * Fetches the project items a pull request belongs to.
-     */
-    public async getProjectItemsForPullRequest(owner: string, repo: string, number: number) {
-        const response = await this.octokit.graphql<{
-            repository: {
-                pullRequest: {
-                    projectItems: {
-                        nodes: {
-                            id: string;
-                            project: {
-                                id: string;
-                                number: number;
-                            };
-                        }[];
-                    };
-                } | null;
-            } | null;
-        }>(
-            `query getProjectItems($owner: String!, $repo: String!, $number: Int!) {
-                repository(owner: $owner, name: $repo) {
-                    pullRequest(number: $number) {
-                        projectItems(first: 10) {
-                            nodes {
-                                id
-                                project {
-                                    id
-                                    number
-                                }
-                            }
-                        }
-                    }
-                }
-            }`,
-            { owner, repo, number },
-        );
-        return response.repository?.pullRequest?.projectItems?.nodes ?? [];
-    }
     /**
      * Fetches the fields defined on a project.
      */

@@ -1,4 +1,4 @@
-export const PRODUCT_ENGINEERING_TEAM_SLUG = 'product-engineering';
+export const PARENT_TEAM_SLUGS: readonly string[] = ['product-engineering', 'store-engineering'];
 
 export const LABELS = {
     ADHOC: 'adhoc',
@@ -21,6 +21,13 @@ export const PROJECT_FIELD_NAMES = {
     SPRINT: 'Sprint',
     STATUS: 'Status',
 } as const;
+
+export const ISSUE_FIELD_NAMES = {
+    PRIORITY: 'Priority',
+} as const;
+
+// Epics are exempt from the estimate, type and priority checks of linked issues.
+export const EPIC_ISSUE_TYPE = 'Epic';
 
 export const STATUS_FIELD_VALUES = {
     NEW_ISSUES: 'New Issues',
@@ -46,6 +53,13 @@ export const SKIP_LINKING_AND_ESTIMATE_CHECKS_FOR_TEAMS: readonly string[] = ['D
 
 // Error returned by the `addCloseIssueReferences` mutation when the issue has too many manually linked pull requests.
 export const MANUAL_REFERENCE_LIMIT_ERROR_MESSAGE = 'Issue exceeds manual reference limit';
+
+// The types of https://github.com/conventional-changelog/commitlint/tree/master/%40commitlint/config-conventional
+export const CONVENTIONAL_COMMIT_REGEXP =
+    /^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([^)]*\))?!?: \S/;
+
+// A warning is shown when the pull request has more commits than this.
+export const MAX_COMMITS_WITHOUT_WARNING = 5;
 
 export const LINKING_CHECK_RETRIES = 8;
 export const LINKING_CHECK_DELAY_MILLIS = 15 * 1000;
